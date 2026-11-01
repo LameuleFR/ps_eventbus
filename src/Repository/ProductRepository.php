@@ -58,9 +58,9 @@ class ProductRepository extends AbstractRepository implements RepositoryInterfac
 
         $this->generateMinimalQuery(self::TABLE_NAME, 'p');
 
+        $this->innerJoinShopAndLang($this->query, 'p', (int) parent::getShopContext()->id, $langId);
+
         $this->query
-            ->innerJoin('product_shop', 'ps', 'ps.id_product = p.id_product AND ps.id_shop = ' . parent::getShopContext()->id)
-            ->innerJoin('product_lang', 'pl', 'pl.id_product = ps.id_product AND pl.id_shop = ps.id_shop AND pl.id_lang = ' . $langId)
             ->leftJoin('product_attribute_shop', 'pas', 'pas.id_product = p.id_product AND pas.id_shop = ps.id_shop')
             ->leftJoin('product_attribute', 'pa', 'pas.id_product_attribute = pa.id_product_attribute')
             ->leftJoin('category_lang', 'cl', 'ps.id_category_default = cl.id_category AND ps.id_shop = cl.id_shop AND cl.id_lang = ' . $langId)
@@ -161,6 +161,7 @@ class ProductRepository extends AbstractRepository implements RepositoryInterfac
     {
         $this->generateFullQuery($langIso, true);
 
+        $lastA = null;
         if ($lastSeekKey !== null) {
             list($lastA, $lastB) = $this->decodeCompositeSeekKey($lastSeekKey);
             // Explicit OR form keeps the (id_product, id_product_attribute)
@@ -172,9 +173,76 @@ class ProductRepository extends AbstractRepository implements RepositoryInterfac
             );
         }
 
-        $this->query->limit((int) $limit);
+        $limit = (int) $limit;
+        // a limit of 0 means no LIMIT clause for DbQuery: the page then holds every remaining row, keep it that way
+        if ($limit > 0 && $limit < PHP_INT_MAX) {
+            $this->restrictToNextProducts($lastA, $limit + 1, $langIso);
+        }
+        $this->query->limit($limit);
 
         return $this->runQuery();
+    }
+
+    /**
+     * Inner joins that decide which products the full query covers. restrictToNextProducts() relies on them being
+     * the only ones: an inner join or a filter that drops products must be added here, not in generateFullQuery().
+     *
+     * @param \DbQuery $query
+     * @param string $productAlias alias of the product table; the joined tables get it suffixed with "s" and "l"
+     * @param int $shopId
+     * @param int $langId
+     *
+     * @return void
+     */
+    private function innerJoinShopAndLang(\DbQuery $query, $productAlias, $shopId, $langId)
+    {
+        $shopAlias = $productAlias . 's';
+        $langAlias = $productAlias . 'l';
+
+        $query
+            ->innerJoin(
+                'product_shop',
+                $shopAlias,
+                $shopAlias . '.id_product = ' . $productAlias . '.id_product AND ' . $shopAlias . '.id_shop = ' . (int) $shopId
+            )
+            ->innerJoin(
+                'product_lang',
+                $langAlias,
+                $langAlias . '.id_product = ' . $shopAlias . '.id_product AND ' . $langAlias . '.id_shop = ' . $shopAlias . '.id_shop'
+                . ' AND ' . $langAlias . '.id_lang = ' . (int) $langId
+            );
+    }
+
+    /**
+     * Joins the page query to the next $count products from $fromProductId included, so that it sorts the rows of
+     * those products only instead of every remaining row. The rows returned are the same: every product kept by
+     * innerJoinShopAndLang() yields at least one row (the other joins are left joins), so $limit + 1 products cover
+     * the first $limit rows after the seek key, even when the product of the seek key has no row left.
+     *
+     * @param int|null $fromProductId
+     * @param int $count
+     * @param string $langIso
+     *
+     * @return void
+     */
+    private function restrictToNextProducts($fromProductId, $count, $langIso)
+    {
+        $nextProducts = new \DbQuery();
+        $nextProducts->select('wp.id_product')->from(self::TABLE_NAME, 'wp');
+        $this->innerJoinShopAndLang(
+            $nextProducts,
+            'wp',
+            (int) parent::getShopContext()->id,
+            (int) \Language::getIdByIso($langIso)
+        );
+        if ($fromProductId !== null) {
+            $nextProducts->where('wp.id_product >= ' . (int) $fromProductId);
+        }
+        $nextProducts->orderBy('wp.id_product ASC')->limit((int) $count);
+
+        $this->query->join(
+            'INNER JOIN (' . $nextProducts->build() . ') next_products ON next_products.id_product = p.id_product'
+        );
     }
 
     /**
